@@ -1,3 +1,5 @@
+// ✅ Scrapbook Films Chat Backend (Super-Conservative Mode)
+// ---------------------------------------------------------
 const express = require('express');
 const bodyParser = require('body-parser');
 const OpenAI = require('openai');
@@ -19,7 +21,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- Chat History ---
+// --- Chat History Endpoint ---
 app.get('/chat-history', async (req, res) => {
   const { threadId } = req.query;
   if (!threadId) return res.status(400).json({ error: 'threadId is required' });
@@ -35,6 +37,9 @@ app.get('/chat-history', async (req, res) => {
   }
 });
 
+// --- Helper Function ---
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // --- Chat Endpoint ---
 app.post('/chat', async (req, res) => {
   const { assistantId, threadId, userMessage, currentPage, fullUrl, pageTitle, serviceName } = req.body;
@@ -45,22 +50,21 @@ app.post('/chat', async (req, res) => {
       currentThreadId = thread.id;
     }
 
-    // Wait for any active run to finish before adding new messages
-    const waitForPreviousRun = async () => {
-      const messagesList = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
-      if (messagesList.data.length) {
-        const lastMsg = messagesList.data[0];
-        if (lastMsg.run_id) {
-          let lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastMsg.run_id);
-          while (lastRun.status === 'in_progress' || lastRun.status === 'queued') {
-            await new Promise(resolve => setTimeout(resolve, 500));
-            lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastRun.id);
-          }
-        }
-      }
-    };
+    // Check if any previous run is still active
+    let lastRun = null;
+    const messagesList = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
+    if (messagesList.data.length) {
+      const lastMsg = messagesList.data[0];
+      if (lastMsg.run_id) lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastMsg.run_id);
+    }
 
-    await waitForPreviousRun();
+    if (lastRun && (lastRun.status === 'in_progress' || lastRun.status === 'queued')) {
+      // 🟡 Early return to avoid "run is active" 400 errors
+      return res.json({
+        response: "Sorry — I’m still processing your last message. Please try again in a few seconds.",
+        threadId: currentThreadId
+      });
+    }
 
     // Add user message
     await openai.beta.threads.messages.create(currentThreadId, {
@@ -75,11 +79,24 @@ app.post('/chat', async (req, res) => {
 
     // Start assistant run
     const run = await openai.beta.threads.runs.create(currentThreadId, { assistant_id: assistantId });
+
+    // Wait briefly for response, with timeout fail-safe
+    const timeoutMs = 8000; // 8 seconds
+    const start = Date.now();
     let runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
 
-    while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    while ((runStatus.status === 'in_progress' || runStatus.status === 'queued') &&
+           Date.now() - start < timeoutMs) {
+      await wait(500);
       runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
+    }
+
+    // Timeout: return gracefully instead of hanging
+    if (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
+      return res.json({
+        response: "Sorry — the assistant is taking a bit longer to respond. Please try again in a moment.",
+        threadId: currentThreadId
+      });
     }
 
     // Handle tools if required
@@ -91,33 +108,44 @@ app.post('/chat', async (req, res) => {
           try {
             const args = JSON.parse(toolCall.function.arguments);
             await axios.post(process.env.GETFORM_URL, args, { headers: { 'Accept': 'application/json' } });
-            toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' }) });
+            toolOutputs.push({
+              tool_call_id: toolCall.id,
+              output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' })
+            });
           } catch (err) {
-            toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'error', message: 'Failed to send.' }) });
+            toolOutputs.push({
+              tool_call_id: toolCall.id,
+              output: JSON.stringify({ status: 'error', message: 'Failed to send.' })
+            });
           }
         }
       }
+
       if (toolOutputs.length) {
         const toolRun = await openai.beta.threads.runs.submitToolOutputs(currentThreadId, run.id, { tool_outputs: toolOutputs });
         runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
         while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
+          await wait(500);
+          runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, runStatus.id);
         }
       }
     }
 
-    // Return assistant response
+    // Fetch latest messages
     const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
     const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
-    const responseText = assistantResponse?.content[0]?.text?.value || "Sorry, the assistant is taking a bit longer to respond. Please try again in a moment.";
+    const responseText = assistantResponse?.content[0]?.text?.value || 
+      "Sorry — I couldn’t generate a response right now. Please try again.";
+
     res.json({ response: responseText, threadId: currentThreadId });
   } catch (error) {
     console.error("Chat Error:", error.message);
-    res.status(500).json({ error: "I'm sorry, there was a problem connecting to the AI. Please try again later." });
+    res.status(500).json({
+      error: "I'm sorry, there was a problem connecting to the AI. Please try again later."
+    });
   }
 });
 
 // --- Render Port ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Scrapbook Films Chat Server running on port ${PORT}`));
