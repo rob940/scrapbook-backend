@@ -26,7 +26,7 @@ app.get('/chat-history', async (req, res) => {
     try {
         const messages = await openai.beta.threads.messages.list(threadId, { order: 'asc' });
         const history = messages.data
-            .filter(msg => msg.content[0]?.type === 'text') // Ensure message has text content
+            .filter(msg => msg.content[0]?.type === 'text')
             .map(msg => ({
                 role: msg.role,
                 content: msg.content[0].text.value
