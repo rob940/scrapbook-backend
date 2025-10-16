@@ -8,7 +8,7 @@ app.use(bodyParser.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- CORS ---
+// Allowed origins
 const allowedOrigins = ['https://scrapbookfilms.com', 'https://www.scrapbookfilms.com'];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -19,10 +19,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- CHAT HISTORY ---
+// Thread concurrency locks
+const threadLocks = new Map();
+
+// --- GET Chat History ---
 app.get('/chat-history', async (req, res) => {
   const { threadId } = req.query;
   if (!threadId) return res.status(400).json({ error: 'threadId is required' });
+
   try {
     const messages = await openai.beta.threads.messages.list(threadId, { order: 'asc' });
     const history = messages.data
@@ -38,74 +42,77 @@ app.get('/chat-history', async (req, res) => {
   }
 });
 
-// --- CHAT ENDPOINT ---
+// --- POST Chat ---
 app.post('/chat', async (req, res) => {
+  const { assistantId, threadId, userMessage, currentPage, currentDate } = req.body;
+
   try {
-    const { assistantId, threadId, userMessage, currentPage, currentDate } = req.body;
     let currentThreadId = threadId;
 
-    // Create thread if it doesn’t exist
+    // --- Create thread if needed ---
     if (!currentThreadId) {
       const thread = await openai.beta.threads.create();
       currentThreadId = thread.id;
     }
 
-    // Combine user message with page context safely
-    const userContent = `${userMessage}\n\n[Page: ${currentPage || 'unknown'} | Date: ${currentDate || new Date().toISOString().split('T')[0]}]`;
+    // --- Concurrency Lock per thread ---
+    while (threadLocks.get(currentThreadId)) await new Promise(r => setTimeout(r, 200));
+    threadLocks.set(currentThreadId, true);
 
-    // Send user message
-    await openai.beta.threads.messages.create(currentThreadId, {
-      role: "user",
-      content: userContent
-    });
+    try {
+      // --- Add user message ---
+      await openai.beta.threads.messages.create(currentThreadId, {
+        role: 'user',
+        content: userMessage
+      });
 
-    // Run assistant
-    const run = await openai.beta.threads.runs.create(currentThreadId, { assistant_id: assistantId });
+      // --- Start Assistant Run ---
+      const run = await openai.beta.threads.runs.create(currentThreadId, { assistant_id: assistantId, metadata: { currentPage, currentDate } });
 
-    let runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
-    while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
-    }
+      // --- Wait for run to finish ---
+      let runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
+      while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
+      }
 
-    // Handle required actions (tool calls)
-    if (runStatus.status === 'requires_action') {
-      const toolCalls = runStatus.required_action.submit_tool_outputs.tool_calls;
-      const toolOutputs = [];
-
-      for (const toolCall of toolCalls) {
-        if (toolCall.function.name === 'create_contact') {
-          try {
-            const args = JSON.parse(toolCall.function.arguments);
-            await axios.post(process.env.GETFORM_URL, args, { headers: { 'Accept': 'application/json' } });
-            toolOutputs.push({
-              tool_call_id: toolCall.id,
-              output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' })
-            });
-          } catch (error) {
-            toolOutputs.push({
-              tool_call_id: toolCall.id,
-              output: JSON.stringify({ status: 'error', message: 'Failed to send.' })
-            });
+      // --- Handle Required Tool Calls ---
+      if (runStatus.status === 'requires_action') {
+        const toolCalls = runStatus.required_action.submit_tool_outputs.tool_calls;
+        const toolOutputs = toolCalls.map(tc => {
+          if (tc.function.name === 'create_contact') {
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              axios.post(process.env.GETFORM_URL, args, { headers: { 'Accept': 'application/json' } });
+              return { tool_call_id: tc.id, output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' }) };
+            } catch (err) {
+              return { tool_call_id: tc.id, output: JSON.stringify({ status: 'error', message: 'Failed to send.' }) };
+            }
+          } else {
+            // Ensure every tool call has an output
+            return { tool_call_id: tc.id, output: JSON.stringify({ status: 'skipped', message: 'No action performed.' }) };
           }
+        });
+
+        const toolRun = await openai.beta.threads.runs.submitToolOutputs(currentThreadId, run.id, { tool_outputs: toolOutputs });
+
+        // --- Wait for run to finish after tool outputs ---
+        runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
+        while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
         }
       }
 
-      const toolRun = await openai.beta.threads.runs.submitToolOutputs(currentThreadId, run.id, { tool_outputs: toolOutputs });
-      runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
+      // --- Fetch latest assistant message ---
+      const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
+      const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
+      const responseText = assistantResponse?.content[0]?.text?.value || "I'm sorry, something went wrong.";
 
-      while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
-      }
+      res.json({ response: responseText, threadId: currentThreadId });
+    } finally {
+      threadLocks.set(currentThreadId, false);
     }
-
-    // Get assistant response
-    const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
-    const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
-    const responseText = assistantResponse?.content[0]?.text?.value || "Sorry, I couldn't generate a response.";
-
-    res.json({ response: responseText, threadId: currentThreadId });
   } catch (error) {
     console.error("Chat Error:", error.message);
     res.status(500).json({ error: "Sorry, there was a problem with the AI." });
