@@ -17,7 +17,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// NEW ENDPOINT to get chat history
+// Endpoint to get chat history
 app.get('/chat-history', async (req, res) => {
     const { threadId } = req.query;
     if (!threadId) {
@@ -25,10 +25,12 @@ app.get('/chat-history', async (req, res) => {
     }
     try {
         const messages = await openai.beta.threads.messages.list(threadId, { order: 'asc' });
-        const history = messages.data.map(msg => ({
-            role: msg.role,
-            content: msg.content[0].text.value
-        }));
+        const history = messages.data
+            .filter(msg => msg.content[0]?.type === 'text') // Ensure message has text content
+            .map(msg => ({
+                role: msg.role,
+                content: msg.content[0].text.value
+            }));
         res.json({ history });
     } catch (error) {
         console.error("History Error:", error);
@@ -36,6 +38,7 @@ app.get('/chat-history', async (req, res) => {
     }
 });
 
+// Endpoint to handle a chat message
 app.post('/chat', async (req, res) => {
   const { assistantId, threadId, userMessage } = req.body;
   try {
@@ -55,15 +58,15 @@ app.post('/chat', async (req, res) => {
     if (runStatus.status === 'requires_action') {
         const toolCalls = runStatus.required_action.submit_tool_outputs.tool_calls;
         const toolOutputs = [];
-        const axios = require('axios'); // Ensure axios is required here
+        const axios = require('axios');
         for (const toolCall of toolCalls) {
             if (toolCall.function.name === 'create_contact') {
                 try {
                     const args = JSON.parse(toolCall.function.arguments);
                     await axios.post(process.env.GETFORM_URL, args, { headers: { 'Accept': 'application/json' } });
-                    toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'ok' }) });
+                    toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' }) });
                 } catch (error) {
-                    toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'error' }) });
+                    toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'error', message: 'Failed to send.' }) });
                 }
             }
         }
@@ -74,7 +77,7 @@ app.post('/chat', async (req, res) => {
         } while (runStatus.status === 'in_progress' || runStatus.status === 'queued');
     }
 
-    const messages = await openai.beta.threads.messages.list(currentThreadId);
+    const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
     const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
     const responseText = assistantResponse.content[0].text.value;
     res.json({ response: responseText, threadId: currentThreadId });
