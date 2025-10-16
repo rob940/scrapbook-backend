@@ -45,17 +45,22 @@ app.post('/chat', async (req, res) => {
       currentThreadId = thread.id;
     }
 
-    // Wait for any active run to finish
-    let lastRun = null;
-    const messagesList = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
-    if (messagesList.data.length) {
-      const lastMsg = messagesList.data[0];
-      if (lastMsg.run_id) lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastMsg.run_id);
-    }
-    while (lastRun && (lastRun.status === 'in_progress' || lastRun.status === 'queued')) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastRun.id);
-    }
+    // Wait for any active run to finish before adding new messages
+    const waitForPreviousRun = async () => {
+      const messagesList = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
+      if (messagesList.data.length) {
+        const lastMsg = messagesList.data[0];
+        if (lastMsg.run_id) {
+          let lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastMsg.run_id);
+          while (lastRun.status === 'in_progress' || lastRun.status === 'queued') {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastRun.id);
+          }
+        }
+      }
+    };
+
+    await waitForPreviousRun();
 
     // Add user message
     await openai.beta.threads.messages.create(currentThreadId, {
@@ -71,6 +76,7 @@ app.post('/chat', async (req, res) => {
     // Start assistant run
     const run = await openai.beta.threads.runs.create(currentThreadId, { assistant_id: assistantId });
     let runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
+
     while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
       await new Promise(resolve => setTimeout(resolve, 500));
       runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
@@ -104,7 +110,7 @@ app.post('/chat', async (req, res) => {
     // Return assistant response
     const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
     const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
-    const responseText = assistantResponse?.content[0]?.text?.value || "Sorry, no response generated.";
+    const responseText = assistantResponse?.content[0]?.text?.value || "Sorry, the assistant is taking a bit longer to respond. Please try again in a moment.";
     res.json({ response: responseText, threadId: currentThreadId });
   } catch (error) {
     console.error("Chat Error:", error.message);
