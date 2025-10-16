@@ -8,6 +8,7 @@ app.use(bodyParser.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// --- CORS ---
 const allowedOrigins = ['https://scrapbookfilms.com', 'https://www.scrapbookfilms.com'];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -18,6 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Chat History ---
 app.get('/chat-history', async (req, res) => {
   const { threadId } = req.query;
   if (!threadId) return res.status(400).json({ error: 'threadId is required' });
@@ -33,6 +35,7 @@ app.get('/chat-history', async (req, res) => {
   }
 });
 
+// --- Chat Endpoint ---
 app.post('/chat', async (req, res) => {
   const { assistantId, threadId, userMessage, currentPage, fullUrl, pageTitle, serviceName } = req.body;
   try {
@@ -42,7 +45,7 @@ app.post('/chat', async (req, res) => {
       currentThreadId = thread.id;
     }
 
-    // Wait for any active run to finish before adding a new message
+    // Wait for any active run to finish
     let lastRun = null;
     const messagesList = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
     if (messagesList.data.length) {
@@ -54,16 +57,18 @@ app.post('/chat', async (req, res) => {
       lastRun = await openai.beta.threads.runs.retrieve(currentThreadId, lastRun.id);
     }
 
+    // Add user message
     await openai.beta.threads.messages.create(currentThreadId, {
       role: "user",
       content: [
         {
           type: "text",
-          text: `${userMessage}\n[Page: ${currentPage} | URL: ${fullUrl} | Title: ${pageTitle} | ServiceName: ${serviceName}]`
+          text: `${userMessage}\n[Page: ${currentPage} | URL: ${fullUrl || ''} | Title: ${pageTitle || ''} | ServiceName: ${serviceName || ''}]`
         }
       ]
     });
 
+    // Start assistant run
     const run = await openai.beta.threads.runs.create(currentThreadId, { assistant_id: assistantId });
     let runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
     while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
@@ -71,8 +76,9 @@ app.post('/chat', async (req, res) => {
       runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, run.id);
     }
 
+    // Handle tools if required
     if (runStatus.status === 'requires_action') {
-      const toolCalls = runStatus.required_action.submit_tool_outputs.tool_calls;
+      const toolCalls = runStatus.required_action.submit_tool_outputs.tool_calls || [];
       const toolOutputs = [];
       for (const toolCall of toolCalls) {
         if (toolCall.function.name === 'create_contact') {
@@ -80,22 +86,25 @@ app.post('/chat', async (req, res) => {
             const args = JSON.parse(toolCall.function.arguments);
             await axios.post(process.env.GETFORM_URL, args, { headers: { 'Accept': 'application/json' } });
             toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'ok', confirmation: 'Message sent successfully.' }) });
-          } catch (error) {
+          } catch (err) {
             toolOutputs.push({ tool_call_id: toolCall.id, output: JSON.stringify({ status: 'error', message: 'Failed to send.' }) });
           }
         }
       }
-      const toolRun = await openai.beta.threads.runs.submitToolOutputs(currentThreadId, run.id, { tool_outputs: toolOutputs });
-      runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
-      while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
-        await new Promise(resolve => setTimeout(resolve, 500));
+      if (toolOutputs.length) {
+        const toolRun = await openai.beta.threads.runs.submitToolOutputs(currentThreadId, run.id, { tool_outputs: toolOutputs });
         runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
+        while (runStatus.status === 'in_progress' || runStatus.status === 'queued') {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          runStatus = await openai.beta.threads.runs.retrieve(currentThreadId, toolRun.id);
+        }
       }
     }
 
+    // Return assistant response
     const messages = await openai.beta.threads.messages.list(currentThreadId, { order: 'desc' });
     const assistantResponse = messages.data.find(m => m.run_id === run.id && m.role === 'assistant');
-    const responseText = assistantResponse.content[0].text.value;
+    const responseText = assistantResponse?.content[0]?.text?.value || "Sorry, no response generated.";
     res.json({ response: responseText, threadId: currentThreadId });
   } catch (error) {
     console.error("Chat Error:", error.message);
@@ -103,4 +112,6 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log('Server is running on port 3000'));
+// --- Render Port ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
