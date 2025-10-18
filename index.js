@@ -1,4 +1,4 @@
-// ✅ Scrapbook Films Chat Backend (Super-Conservative Mode)
+// ✅ Scrapbook Films Chat Backend (Final, Corrected Version)
 // index.js
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -55,7 +55,15 @@ app.get('/chat-history', async (req, res) => {
     const messages = await openai.beta.threads.messages.list(threadId, { order: 'asc' });
     const history = messages.data
       .filter(msg => msg.content?.[0]?.type === 'text')
-      .map(msg => ({ role: msg.role, content: msg.content[0]?.text?.value || '' }));
+      .map(msg => {
+        let content = msg.content[0]?.text?.value || '';
+        // **THE DEFINITIVE BUG FIX IS HERE:**
+        // Clean the context string from user messages on the server before sending.
+        if (msg.role === 'user') {
+            content = content.replace(/\n\[Page:.*?\]/sg, '').trim();
+        }
+        return { role: msg.role, content: content };
+      });
     res.json({ history });
   } catch (error) {
     console.error("History Error:", error.message);
